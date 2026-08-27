@@ -86,12 +86,13 @@ def safe_get_env_vars(env_vars: List[str]) -> Dict[str, str]:
 def ipv4_subnet_to_reverse_zone(subnet: str) -> str:
     """
     Convert an IPv4 subnet to its reverse DNS zone name.
+    Handles both classful and CIDR subnets properly.
 
     Args:
-        subnet (str): IPv4 subnet in CIDR notation (e.g., "192.168.1.0/24")
+        subnet (str): IPv4 subnet in CIDR notation (e.g., "192.168.1.0/24", "192.168.1.128/25")
 
     Returns:
-        str: Reverse DNS zone name (e.g., "1.168.192.in-addr.arpa")
+        str: Reverse DNS zone name (e.g., "1.168.192.in-addr.arpa", "128/25.1.168.192.in-addr.arpa")
     """
     try:
         network = ipaddress.IPv4Network(subnet, strict=False)
@@ -103,16 +104,40 @@ def ipv4_subnet_to_reverse_zone(subnet: str) -> str:
         # Convert to octets
         octets = str(network_addr).split('.')
 
-        # Calculate how many octets we need based on prefix length
-        # Each octet represents 8 bits
-        octets_needed = prefix_length // 8
+        # Handle different CIDR scenarios
+        if prefix_length % 8 == 0:
+            # Classful boundary - simple case
+            octets_needed = prefix_length // 8
 
-        # Take the required octets from the beginning and reverse them
-        relevant_octets = octets[:octets_needed]
-        reversed_octets = '.'.join(reversed(relevant_octets))
+            relevant_octets = octets[:octets_needed]
+            reversed_octets = '.'.join(reversed(relevant_octets))
 
-        # Add the in-addr.arpa suffix
-        reverse_zone = f"{reversed_octets}.in-addr.arpa"
+            # Add the in-addr.arpa suffix
+            reverse_zone = f"{reversed_octets}.in-addr.arpa"
+
+        else:
+            # CIDR subnet that doesn't align on octet boundary
+
+            # Calculate the range of addresses this subnet covers
+            start_addr = network.network_address
+            end_addr = network.broadcast_address
+
+            # Get the full octets (complete 8-bit boundaries)
+            full_octets = prefix_length // 8
+            remaining_bits = prefix_length % 8
+
+            # Build the zone name
+            # Include the complete octets in reverse order
+            base_octets = octets[:full_octets]
+            reversed_base = '.'.join(reversed(base_octets))
+
+            # Add the partial octet information
+            partial_octet_start = int(octets[full_octets])
+            partial_octet_end = int(str(end_addr).split('.')[full_octets])
+
+            reverse_zone = f"{partial_octet_start}/{prefix_length}.{reversed_base}.in-addr.arpa"
+
+            logging.info(f"CIDR reverse zone for {subnet}: {reverse_zone}")
 
         return reverse_zone
 
@@ -236,7 +261,17 @@ def check_zone_exists(client: VinylDNSClient, zone_name: str) -> Dict[str, Any]:
         Dict[str, Any]: Dictionary with zone information or error details
     """
     try:
-        zone = client.get_zone_by_name(zone_name)
+        logging.info(f"Checking if zone exists for: {zone_name}")
+        if "/" in zone_name:
+            zone = client.list_zones(name_filter=zone_name)
+            if zone and hasattr(zone, 'zones') and zone.zones:
+                zone = zone.zones[0]
+            else:
+                zone = None
+
+        else:
+            zone = client.get_zone_by_name(zone_name)
+
         if zone:
             return {
                 "exists": True,
@@ -277,6 +312,7 @@ def verify_ip_zones(client: VinylDNSClient, subnets: List[str]) -> List[Dict[str
     results = []
 
     for i, subnet in enumerate(subnets, 1):
+        logging.info(f"\n\n")
         logging.info(f"Processing subnet {i}/{len(subnets)}: {subnet}")
 
         # Convert subnet to reverse zone name
